@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+#
+# Install Kismet on Ubuntu 24.04 (noble) following the published Kismet
+# documentation (https://www.kismetwireless.net/docs/readme/installing/linux/),
+# and run it as a systemd service.
+#
+#  - Kismet is installed from the official Kismet apt repository.
+#  - The capture helpers are installed setuid-root (restricted to the 'kismet'
+#    group), so the Kismet server itself never runs as root.
+#  - Kismet runs as an unprivileged service user that is a member of the
+#    'kismet' group.
+#
+# Usage:   ./detect-devices      (optional, writes kismet-sources.list)
+#          sudo ./install-kismet
+#
+# Optional environment variables:
+#   KISMET_USER     service account               (default: kismet)
+#   KISMET_HOME     data/log dir for that account (default: /var/lib/kismet)
+#   KISMET_SOURCES  space-separated data sources to add to kismet_site.conf,
+#                   e.g. "wlx00c0caa6850f:name=alfa hci0". Added to any
+#                   sources listed in kismet-sources.list (see detect-devices).
+#   KISMET_ADMIN    extra login(s) to add to the 'kismet' group so they can
+#                   run kismet by hand (e.g. "baldrick")
+#
+# Safe to re-run.
+
+set -euo pipefail
+
+KISMET_USER="${KISMET_USER:-kismet}"
+KISMET_HOME="${KISMET_HOME:-/var/lib/kismet}"
+KISMET_SOURCES="${KISMET_SOURCES:-}"
+KISMET_ADMIN="${KISMET_ADMIN:-${SUDO_USER:-}}"
+
+[[ $EUID -eq 0 ]] || { echo "Run as root: sudo $0" >&2; exit 1; }
+
+. /etc/os-release
+[[ "${ID}" == ubuntu && "${VERSION_CODENAME}" == noble ]] ||
+    echo "WARNING: written for Ubuntu 24.04 (noble); found ${PRETTY_NAME}" >&2
+
+export DEBIAN_FRONTEND=noninteractive
+
+# --- 1. Kismet apt repository ------------------------------------------------
+apt-get update
+apt-get install -y wget gpg ca-certificates
+
+wget -qO- https://www.kismetwireless.net/repos/kismet-release.gpg.key |
+    gpg --dearmor --yes -o /usr/share/keyrings/kismet-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/kismet-archive-keyring.gpg] https://www.kismetwireless.net/repos/apt/release/${VERSION_CODENAME} ${VERSION_CODENAME} main" \
+    > /etc/apt/sources.list.d/kismet.list
+
+# --- 2. Install Kismet with suid-root capture helpers ------------------------
+# Answers the "Install Kismet capture tools as suid-root?" debconf question.
+echo "kismet-common kismet-common/install-setuid boolean true" |
+    debconf-set-selections
+
+apt-get update
+apt-get install -y kismet
+
+# Re-assert the setuid configuration in case the package was already installed.
+# (the question is owned by kismet-core; the kismet-capture-* helpers read it)
+dpkg-reconfigure -f noninteractive kismet-core \
+    $(dpkg-query -W -f='${Package}\n' 'kismet-capture-*' 2>/dev/null)
+
+# --- 3. Service account and group membership ---------------------------------
+getent group kismet >/dev/null || groupadd --system kismet
+
+if ! id "${KISMET_USER}" >/dev/null 2>&1; then
+    useradd --system --gid kismet --home-dir "${KISMET_HOME}" \
+            --create-home --shell /usr/sbin/nologin "${KISMET_USER}"
+fi
+usermod -aG kismet "${KISMET_USER}"
+# USB radios (RTL-SDR, Ubertooth, HackRF) are root:plugdev via their udev rules.
+usermod -aG plugdev "${KISMET_USER}"
+# A lockfile left by a manual run as another user blocks the service
+# (fs.protected_regular); it is recreated on demand.
+rm -f /tmp/.kismet_cap_linux_wifi_interface_lock
+install -d -o "${KISMET_USER}" -g kismet -m 0750 "${KISMET_HOME}"
+
+for u in ${KISMET_ADMIN}; do
+    [[ "$u" == root ]] || usermod -aG kismet "$u"
+done
+
+# --- 4. Site configuration (kismet_site.conf overrides kismet.conf) ----------
+# Sources come from KISMET_SOURCES and from kismet-sources.list, which
+# ./detect-devices writes next to this script. The file is only read as data.
+# Logs go to the working directory (log_prefix=./ in kismet_logging.conf),
+# which the service sets to KISMET_HOME.
+list="$(dirname "$(readlink -f "$0")")/kismet-sources.list"
+sources=(${KISMET_SOURCES})
+if [[ -r "${list}" ]]; then
+    while IFS= read -r line; do
+        [[ -z "${line// }" || "${line}" == \#* ]] || sources+=("${line}")
+    done < "${list}"
+fi
+if (( ${#sources[@]} )); then
+    site=/etc/kismet/kismet_site.conf
+    touch "${site}"
+    for s in "${sources[@]}"; do
+        grep -qxF "source=${s}" "${site}" || echo "source=${s}" >> "${site}"
+    done
+fi
+
+# --- 5. systemd service ------------------------------------------------------
+# NoNewPrivileges must NOT be set: it would stop the setuid capture helpers
+# from gaining the privileges they need.
+cat > /etc/systemd/system/kismet.service <<EOF
+[Unit]
+Description=Kismet wireless monitor
+Documentation=https://www.kismetwireless.net/docs/
+ConditionPathExists=/usr/bin/kismet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${KISMET_USER}
+Group=kismet
+WorkingDirectory=${KISMET_HOME}
+ExecStart=/usr/bin/kismet --no-ncurses
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl reset-failed kismet.service 2>/dev/null || true
+systemctl enable kismet.service
+systemctl restart kismet.service
+
+sleep 3
+systemctl --no-pager status kismet.service || true
+
+cat <<EOF
+
+Kismet is installed and running as '${KISMET_USER}'.
+  Web UI:  http://$(hostname -f 2>/dev/null || hostname):2501/  (set the admin password on first visit)
+  Logs:    journalctl -u kismet -f      Data: ${KISMET_HOME}
+  Add data sources with KISMET_SOURCES or in /etc/kismet/kismet_site.conf,
+  then: sudo systemctl restart kismet
+Users added to the 'kismet' group must log out and back in to pick it up.
+EOF
